@@ -1,11 +1,20 @@
 ---
 layout: distill
 title: "Chunked TabPFN: Exact Training-Free In-Context Learning for Long-Context Tabular Data"
-description: >
-  We modify TabPFN so that it can run on long tabular datasets (100K+ rows)
-  without retraining, fine-tuning, data compression, or KNN-style selection.
-  We chunk attention exactly to avoid out-of-memory while keeping predictions
-  identical to standard TabPFN on shorter contexts.
+description: Tabular foundation models like TabPFN, TabICL, Mitra, and Limix typically 
+  only work on medium-sized (<50K samples) datasets. Besides obvious limitations 
+  of pre-training such a model, there is also an inference-side bottleneck of 
+  quadratic attention. To this end, efficient attention implementations such as 
+  FlashAttention series should have made the memory constraints obsolete. 
+  Yet as we highlight in this paper there are important caveats to enabling 
+  these efficient methods for the tabular data in practice. Once we enable 
+  efficient (chunked) attention, we evaluate TabPFN on a series of increasingly
+  complex and long datasets from TabArena benchmark and report the results. 
+  Contrary to the previous reports, TabPFN (v2) performance does not seem to degrade 
+  with the increasing context length; on the opposite, in some cases it seems to 
+  monotonically grow with the context length. Intuitively, this suggests that the 
+  PFN models have strong inductive bias regardless of the dataset size, and may 
+  require only small fine-tuning stage to scale to the longer data. 
 date: 2026-04-27
 future: true
 htmlwidgets: true
@@ -17,17 +26,16 @@ mermaid:
   zoomable: true
 
 # Anonymize when submitting
-# authors:
-#   - name: Anonymous
-
 authors:
-  - name: Renat Sergazinov*
-    affiliations:
-      name: Department of Statistics, Texas A&M University
-  - name: Shao-An Yin*
-    affiliations:
-      name: Department of Electrical and Computer Engineering, University of Minnesota
+  - name: Anonymous
 
+# authors:
+#   - name: Renat Sergazinov*
+#     affiliations:
+#       name: Department of Statistics, Texas A&M University
+#   - name: Shao-An Yin*
+#     affiliations:
+#       name: Department of Electrical and Computer Engineering, University of Minnesota
 # *equal contribution note will appear in-body so we don't leak identity in metadata if anonymized version is needed
 
 # must be the exact same name as your blogpost (no extension)
@@ -69,69 +77,49 @@ _styles: >
     margin-top: 0.5rem;
     text-align: center;
   }
----
-
-**Note:** please use the table of contents defined in the front matter rather than writing your own manual table of contents inside the post.
-
-## Abstract
-
-TabPFN v2 outperforms strong tree-based baselines on several tabular benchmarks, which is impressive because boosted trees are usually the most competitive out-of-the-box choice for tabular data. However, TabPFN cannot normally handle more than about 10K context tokens because the transformer’s attention is quadratic in both compute and memory.
-
-We introduce a tiled / chunked attention mechanism that is mathematically exact (not an approximation) and that can be dropped into TabPFN without retraining or fine-tuning. Our method computes attention in blocks and merges them using a numerically stable running softmax, so peak memory now scales with the block size rather than the full context length. This lets TabPFN evaluate with 100K+ training examples as in-context evidence, on standard GPUs, without any pre-processing such as clustering, KNN retrieval, or dataset-specific compression.
-
-On the TabArena benchmark, we show:
-(1) TabPFN continues to benefit from longer contexts beyond its original 10K-token limit.
-(2) Our chunked implementation matches baseline TabPFN performance when the context is short, while enabling inference on long-context datasets where the baseline runs out of memory.
-(3) The approach requires zero task-specific training and preserves the “single forward pass” foundation-model style inference.
 
 ---
 
-## 1. Introduction
+Large language models leverage **in-context learning (ICL)**: you provide examples, and the model adapts its predictions at inference time—no gradient updates required. Recent work on **tabular foundation models**, such as TabPFN, TabICL, Mitra, and Limix, applies a similar concept to tabular data. These models are trained once on synthetic tasks drawn from a prior, allowing them to approximate the posterior predictive distribution  
 
-Large language models use in-context learning: you hand them examples, and they adapt their predictions at inference time without gradient updates. TabPFN applies a similar idea to tabular data: it trains a transformer once on synthetic tasks drawn from a prior, so that at test time it can directly approximate the posterior predictive distribution
 $$
-p(y_\* \mid x_\*, D_{\text{train}})
-$$
-in a single forward pass, without per-dataset fine-tuning. <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>
+p(y_{*} \mid x_*, D_{\text{train}})
+$$  
 
-This is appealing because most deep tabular models (TabNet <d-cite key="arik2021tabnet"></d-cite>, FT-Transformer <d-cite key="gorishniy2021revisiting"></d-cite>, NODE <d-cite key="popov2019neural"></d-cite>, TabM <d-cite key="gorishniy2024tabm"></d-cite>, retrieval-style models like TabR and ModernNCA <d-cite key="gorishniy2023tabr,ye2024modern"></d-cite>, TabDPT <d-cite key="ma2024tabdpt"></d-cite>) still require training or fine-tuning on each new dataset. That means they are not true “drop-in foundation models.”
+in a single forward pass, without fine-tuning on each new dataset <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. In this work, we focus specifically on **TabPFN**, though we believe our findings could extend to other ICL-based tabular models.
 
-TabPFN is closer to that ideal — but it has a big blocker: context length. The transformer attention cost grows quadratically with sequence length. The public TabPFN variants have practical limits around 3K samples in the original work and ~10K samples in later work <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. Many real tabular datasets are bigger than that.
+This approach is compelling because it contrasts with most deep tabular models—like TabNet, FT-Transformer, NODE, TabM, or retrieval-style models such as TabR and ModernNCA—which typically require dataset-specific training or fine-tuning <d-cite key="arik2021tabnet,gorishniy2021revisiting,popov2019neural,gorishniy2024tabm,gorishniy2023tabr,ye2024modern"></d-cite>. That dependency undermines the ideal of a true "drop-in foundation model."
 
-People have tried to work around this by *shrinking the context*:
+TabPFN moves closer to this ideal. However, it faces a major limitation: **context length**. Transformer attention scales quadratically with sequence length, and current public TabPFN implementations are constrained to around 3,000 samples in the original work and 10,000 in later versions <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. Many real-world tabular datasets far exceed these limits.
 
-- Cluster or partition the training set into smaller subsets, then run TabPFN on each piece or retrieve only a subset per query. Examples: random-forest partitioning and ensembling <d-cite key="hollmann2025accurate"></d-cite>, Mixture of In-Context Prompters (MICP) <d-cite key="xu2024mixture"></d-cite>, KNN-style retrieval per test point <d-cite key="thomas2024retrieval"></d-cite>.
-- Compress the dataset into a smaller learned representation (TuneTables), so you don’t have to feed all rows in directly. <d-cite key="feuer2024tunetables"></d-cite>
+To address this, researchers have experimented with **shrinking the context**, such as by clustering, partitioning, or retrieving only subsets of the data. Examples include random-forest partitioning <d-cite key="hollmann2025accurate"></d-cite>, the Mixture of In-Context Prompters (MICP) <d-cite key="xu2024mixture"></d-cite>, and KNN-style retrieval <d-cite key="thomas2024retrieval"></d-cite>. Others, like TuneTables <d-cite key="feuer2024tunetables"></d-cite>, compress the data into learned representations.
 
-Those approaches can work well, but they introduce two problems:
+While these methods can be effective, they come with two drawbacks:
 
-1. They usually require per-dataset tuning or even gradient updates, which breaks the spirit of “pure in-context, zero-shot inference.”
-2. They no longer feed TabPFN the *full* training set. Conceptually, TabPFN is supposed to approximate the Bayesian posterior given all observed data. Replacing that data with a clustered summary is no longer exact.
+- They often require **dataset-specific tuning** or even retraining, which contradicts the zero-shot, pure ICL philosophy.
+- They don’t use the **entire training set**, which is a core assumption of TabPFN’s Bayesian approximation. Replacing full data with summaries introduces conceptual inaccuracy.
 
-So we ask:
+Hence, we ask the following question:
 
-1. Can we keep *all* training examples in the context (no pruning, no KNN), and still fit in GPU memory?
-2. Can we do this without any retraining, so TabPFN stays zero-shot?
+> Can we fit **all training examples** into the context (no pruning, no KNN) without learnable compression while staying within GPU memory?
 
-Our answer is yes. We introduce a memory-efficient, blockwise attention evaluation — we’ll call it **chunked attention** — that:
-- Computes attention scores in tiles,
-- Merges them with an incremental log-sum-exp trick,
-- Produces the exact same result (up to floating-point associativity) as standard attention.
+Our answer is a resounding **yes**. Indeed, TabPFN’s native implementation already supports this on some devices via **FlashAttention**. But as we’ll show in this blogpost, there are important caveats:
 
-No approximations, no fine-tuning, and no KNN pre-filtering.
+- FlashAttention and similar efficient mechanisms can **fail** when batch or head sizes exceed 65,535.
+- These optimizations are **unsupported** on older or consumer-grade GPUs.
 
-We then evaluate this “chunked TabPFN” on TabArena <d-cite key="tabarena"></d-cite>, focusing especially on “long-context” datasets where $n$ is far beyond 10K. We observe that:
-- TabPFN accuracy (AUC for classification, RMSE for regression) often keeps improving as we feed it *more* rows, sometimes up to 100K+.
-- When the context is short (<10K), our chunked version matches the original TabPFN’s predictions — so we aren’t secretly degrading it.
-- Runtime remains practical on commodity GPUs.
+To resolve this, we introduce a **simple patch**:
 
-Finally, we summarize our contributions:
+- For efficient attention, we **chunk inputs** along head or batch dimensions to avoid hitting the 65,536 limit.
+- For older GPUs, we implement a **chunked forward pass** in pure PyTorch using the **incremental log-sum-exp trick**.
 
-1. **Training-free long-context extension.**  
-   We propose a pure-PyTorch exact chunked attention routine (compatible with FlashAttention or native scaled dot-product attention) that makes TabPFN run on datasets with over 100K samples, with no retraining.
+This patch yields results **identical to standard attention** (up to floating-point associativity), without any approximations, fine-tuning, or pre-filtering. 
 
-2. **Empirical analysis.**  
-   We benchmark on the TabArena suite and a curated subset of long-context tasks. We see stable or improved performance as context grows *past* the original 10K limit. This gives a new, purely in-context baseline for future long-context tabular research.
+Empirically, we then test TabPFN out-of-the-box scalability by evaluating it on the full **TabArena** benchmark <d-cite key="tabarena"></d-cite>. We specifically analyze TabPFN performance on datasets with **long contexts** (> 10,000). Key findings include:
+
+- **Accuracy improves** with more data, often up to 100,000+ rows (measured in AUC for classification and RMSE for regression).
+- On smaller contexts (<10,000), our chunked version **matches the original**—no hidden degradation.
+- The runtime stays **practical** even on commodity GPUs.
 
 ---
 
