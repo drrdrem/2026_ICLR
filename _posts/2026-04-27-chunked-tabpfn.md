@@ -1,20 +1,7 @@
 ---
 layout: distill
-title: "Chunked TabPFN: Exact Training-Free In-Context Learning for Long-Context Tabular Data"
-description: Tabular foundation models like TabPFN, TabICL, Mitra, and Limix typically 
-  only work on medium-sized (<50K samples) datasets. Besides obvious limitations 
-  of pre-training such a model, there is also an inference-side bottleneck of 
-  quadratic attention. To this end, efficient attention implementations such as 
-  FlashAttention series should have made the memory constraints obsolete. 
-  Yet as we highlight in this paper there are important caveats to enabling 
-  these efficient methods for the tabular data in practice. Once we enable 
-  efficient (chunked) attention, we evaluate TabPFN on a series of increasingly
-  complex and long datasets from TabArena benchmark and report the results. 
-  Contrary to the previous reports, TabPFN (v2) performance does not seem to degrade 
-  with the increasing context length; on the opposite, in some cases it seems to 
-  monotonically grow with the context length. Intuitively, this suggests that the 
-  PFN models have strong inductive bias regardless of the dataset size, and may 
-  require only small fine-tuning stage to scale to the longer data. 
+title: "ChunkTabPFN: Training-free Long Context"
+description: Tabular foundation models struggle with large datasets due to the quadratic attention. While methods like FlashAttention promise scalability, practical challenges persist in their application to tabular data. Our work resolves these hurdles, enabling efficient attention, and reveals that contrary to the eariler reports, TabPFN's performance improves with larger contexts, highlighting its inherent robustness and minimal fine-tuning needs when scaling to complex, long datasets from the TabArena benchmark.
 date: 2026-04-27
 future: true
 htmlwidgets: true
@@ -44,23 +31,10 @@ bibliography: 2026-04-27-chunked-tabpfn.bib
 
 # Table of contents for the right-hand nav
 toc:
-  - name: Abstract
   - name: 1. Introduction
   - name: 2. Methodology
-    subsections:
-      - name: Notation
-      - name: Attention and Scaling Limits
-      - name: Exact Chunked Attention
   - name: 3. Experiments
-    subsections:
-      - name: Setup
-      - name: Results
   - name: 4. Conclusion
-  - name: Appendix
-    subsections:
-      - name: A. Implementation Details
-      - name: B. Full TabArena Results
-      - name: C. Per-Dataset Scaling Analysis
 
 # Optional per-post styles (fine to delete if you don't need it)
 _styles: >
@@ -80,6 +54,9 @@ _styles: >
 
 ---
 
+## 1. Introduction
+<span id="sec:introduction"></span>
+
 Large language models leverage **in-context learning (ICL)**: you provide examples, and the model adapts its predictions at inference time—no gradient updates required. Recent work on **tabular foundation models**, such as TabPFN, TabICL, Mitra, and Limix, applies a similar concept to tabular data. These models are trained once on synthetic tasks drawn from a prior, allowing them to approximate the posterior predictive distribution  
 
 $$
@@ -88,9 +65,9 @@ $$
 
 in a single forward pass, without fine-tuning on each new dataset <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. In this work, we focus specifically on **TabPFN**, though we believe our findings could extend to other ICL-based tabular models.
 
-This approach is compelling because it contrasts with most deep tabular models—like TabNet, FT-Transformer, NODE, TabM, or retrieval-style models such as TabR and ModernNCA—which typically require dataset-specific training or fine-tuning <d-cite key="arik2021tabnet,gorishniy2021revisiting,popov2019neural,gorishniy2024tabm,gorishniy2023tabr,ye2024modern"></d-cite>. That dependency undermines the ideal of a true "drop-in foundation model."
+This approach is compelling because it contrasts with most deep tabular models—like TabNet, FT-Transformer, NODE, TabM, or retrieval-style models such as TabR and ModernNCA, which typically require dataset-specific training or fine-tuning <d-cite key="arik2021tabnet,gorishniy2021revisiting,popov2019neural,gorishniy2024tabm,gorishniy2023tabr,ye2024modern"></d-cite>. That dependency undermines the ideal of a true "drop-in foundation model."
 
-TabPFN moves closer to this ideal. However, it faces a major limitation: **context length**. Transformer attention scales quadratically with sequence length, and current public TabPFN implementations are constrained to around 3,000 samples in the original work and 10,000 in later versions <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. Many real-world tabular datasets far exceed these limits.
+TabPFN moves closer to this ideal. However, it faces a major limitation: **context length**. Transformer attention scales quadratically with sequence length, and current public TabPFN implementations are constrained to around 3,000 samples in the original work and 50,000 in later versions <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. Many real-world tabular datasets far exceed these limits.
 
 To address this, researchers have experimented with **shrinking the context**, such as by clustering, partitioning, or retrieving only subsets of the data. Examples include random-forest partitioning <d-cite key="hollmann2025accurate"></d-cite>, the Mixture of In-Context Prompters (MICP) <d-cite key="xu2024mixture"></d-cite>, and KNN-style retrieval <d-cite key="thomas2024retrieval"></d-cite>. Others, like TuneTables <d-cite key="feuer2024tunetables"></d-cite>, compress the data into learned representations.
 
@@ -121,467 +98,156 @@ Empirically, we then test TabPFN out-of-the-box scalability by evaluating it on 
 - On smaller contexts (<10,000), our chunked version **matches the original**—no hidden degradation.
 - The runtime stays **practical** even on commodity GPUs.
 
----
 
 ## 2. Methodology
+<span id="sec:methodology"></span>
 
-We describe why vanilla TabPFN blows up in memory for long datasets, and how our chunking fix works.
+Let `(X, y)` be the input to the TabPFN model. The typical dimensions of the feature tensor are `[B, L, F]`, where `B` is the number of datasets in the batch, `L` is the (padded) sample size, and `F` is the number of features. The first thing TabPFN does is group features `X` and embed them, which yields the following shape: `[B, L, G, D]`, where `G` is the number of feature groups and `D` is the embedding size. In the rest of the blog, we assume `X` already has this post-embedding shape.
 
-### Notation
+The labels `y` are similarly embedded and then concatenated with the features along the group dimension, producing an input of shape `[B, L, G + 1, D]`. A keen reader might notice that `y` and `X` effectively have different “logical” lengths: `X` includes both train and test samples, while `y` is only provided for the training split. This is handled by padding the label embeddings for test samples with a dummy embedding. A variable `single_eval_pos` in the original code holds the index where train and test samples are concatenated, and this logic can be seen in the `transformer.py` file of the original TabPFN repository.
 
-We treat the training set (the “context”) as
-$$
-D_{\text{train}} = \{ (x_i, y_i) \}_{i=1}^{n},
-$$
-where each $x_i \in \mathbb{R}^p$ has $p$ features and $y_i \in \mathcal{Y}$ is the label.  
-We’ll denote a test sample as $x_\*$, and a batch of test samples as
-$$
-D_{\text{test}} = \{ (x_j, y_j) \}_{j=1}^{m}.
-$$
+The core of TabPFN is the attention mechanism, whose logic is primarily implemented in `layer.py`. TabPFN, like many Transformer-style models, uses attention in two ways: **between samples** and **between features**. The between-sample attention has both self- and cross-attention components: self-attention among training samples and cross-attention from test samples to train samples. Following the TabPFN implementation, we assume attention layers expect input of shape `[batch, seq_len, input_size]`. In the code, the leading dimensions before `(seq_len, input_size)` are collapsed via `_rearrange_inputs_to_flat_batch`. For between-feature attention this yields an effective batch size of `L * B`, whereas for between-item (between-sample) attention it yields `(G + 1) * B`.
 
-Inside the transformer, attention operates on Query ($Q$), Key ($K$), and Value ($V$) tensors.  
-We’ll write:
-- $L$ = sequence length (number of tokens / rows seen by that layer),
-- $B$ = batch size,
-- $H$ = number of attention heads,
-- $d_k$ = per-head key/query dimension.
+Recall that efficient attention implementations in PyTorch (such as the fused CUDA kernels backing `torch.nn.functional.scaled_dot_product_attention`) tile work across the **batch** and **head** dimensions. On NVIDIA GPUs of Ampere architecture and below, this effectively limits the product `B * num_heads` to at most `65535` CUDA blocks; when it reaches `65536` the kernel can fail with  
+`RuntimeError: CUDA error: invalid configuration argument` (see the corresponding PyTorch GitHub issue for a minimal example where `65535` works but `65536` fails). In TabPFN, large sample sizes `L` or a large number of feature groups `G` can easily push these flattened batch sizes (`L * B` or `(G + 1) * B`) past this limit.
 
-Then
-$$
-Q \in \mathbb{R}^{B \times H \times L_q \times d_k}, \quad
-K \in \mathbb{R}^{B \times H \times L_k \times d_k}, \quad
-V \in \mathbb{R}^{B \times H \times L_k \times d_k}.
-$$
-
-Scaled dot-product attention for one head is
-$$
-\mathrm{Attn}(Q, K, V)
-=
-\text{softmax}\!\left(
-\frac{QK^\top}{\sqrt{d_k}}
-\right) V.
-$$
-
-The big problem is that the score matrix $QK^\top$ is size $L_q \times L_k$, so memory and compute scale like $\mathcal{O}(B \cdot H \cdot L_q \cdot L_k)$.
-
-TabPFN internally uses attention in three places (following <d-cite key="hollmann2025accurate"></d-cite>):
-
-1. **Between-feature attention**: here $B \approx n$ and $L \approx p$ (or groups of features).
-2. **Self-attention over $D_{\text{train}}$**: here $B \approx p$ and $L \approx n$. This is quadratic in $n$.
-3. **Cross-attention from $D_{\text{train}}$ to $D_{\text{test}}$**: queries are test points ($m$ of them), keys/values are training points ($n$ of them). So cost is $\mathcal{O}(m \cdot n)$, multiplied by heads, etc.
-
-As $n$ grows, (2) and (3) explode — you run out of VRAM.
-
-### Attention and Scaling Limits
-
-Let’s zoom in on the standard attention calculation. For a given head,
-$$
-Z = \frac{QK^\top}{\sqrt{d_k}} \in \mathbb{R}^{B \times H \times L_q \times L_k},
-$$
-then
-$$
-\text{softmax}(Z) V
-$$
-is computed row-wise over the $L_k$ keys for each query position.  
-If $L_q$ and $L_k$ are both ~100K, you are never going to materialize $Z$ on a typical 24–32GB GPU.
-
-But notice: mathematically, you don’t *need* all of $Z$ at once. The only thing you need for each query row is:
-1. The final softmax-normalized weights across *all* keys.
-2. The weighted sum of $V$ using those weights.
-
-We exploit that.
-
-### Exact Chunked Attention
-
-We compute attention in **tiles** (also: chunks / blocks), and we merge those tiles in a numerically stable way that keeps the result identical to full attention (up to normal floating point differences).
-
-Outline:
-
-1. **Split $Q$ into query tiles.**  
-   Take a slice of queries $Q^{(c)}$ of length $\ell$ instead of all $L_q$ at once.
-
-2. **Stream over $K$/$V$ tiles.**  
-   For that query tile, don’t multiply against all keys at once.  
-   Instead, break $K,V$ into chunks $(K^{(t)}, V^{(t)})$ of length $r$.  
-   Compute local logits
-   $$
-   Z^{(t)} = \frac{Q^{(c)} {K^{(t)}}^\top}{\sqrt{d_k}}
-   $$
-   which is only $\ell \times r$, not $\ell \times L_k$.
-
-3. **Maintain running log-sum-exp stats per query row.**  
-   For each query row, we keep:
-   - a running max $\mu$,
-   - a running sum of exponentials $s$,
-   - and a running sum of (exp * V) called $a$.
-
-   Every time we process a new tile of keys, we update $(\mu, s, a)$ using the stable log-sum-exp merge trick.
-   This is standard numerics: you rescale old partial sums so you never overflow or underflow.
-
-   After streaming all key chunks, we have
-   $$
-   s = \sum_k e^{z_k}, \quad
-   a = \sum_k e^{z_k} v_k
-   $$
-   for each query row, *as if* we had seen all keys at once.  
-   Final attention output = $a / s$.
-
-4. **Concatenate all query tiles.**  
-   We repeat this for each query tile $Q^{(c)}$, then stitch the results back together along the query axis, recovering the full $L_q$ output.
-
-Properties:
-- **Exactness:**  
-  Each query row sees *all* keys (just not all at once), and we merge logits exactly via log-sum-exp.  
-  So the result matches monolithic attention (again: within standard FP associativity noise).
-- **Memory:**  
-  Peak memory now scales with tile sizes $\ell$ and $r$, not full $L_q$ and $L_k$.  
-  So we can push to $n=100\text{K}+$.
-- **Compatibility:**  
-  This is pure PyTorch tensor math (matmul/einsum + a tiny loop), so it works with native scaled dot-product attention or FlashAttention backends, and doesn’t require re-training TabPFN.
-
-Below is a high-level pseudocode version (reformatted from our Appendix):
+A simple practical fix is to loop over the flattened batch dimension in chunks, so that each call to `scaled_dot_product_attention` stays within the kernel’s limits. This keeps the rest of the model unchanged while avoiding the `invalid configuration` errors at large `L` or `G`. Conceptually, this is can be done via the following patch to the attention computation.
 
 ```python
-for each query tile Q_c of size (B, H, ell, d_k):
-    # running stats per query position
-    mu = -inf        # (B, H, ell, 1)
-    s  = 0           # (B, H, ell, 1)
-    a  = 0           # (B, H, ell, d_k)
+outputs = []
 
-    for each key/value tile (K_t, V_t) of size (B, H, r, d_k):
-        # local logits for this block
-        Z_t = (Q_c @ K_t.transpose(-1, -2)) / sqrt(d_k)
-        # rowwise max over keys in this tile
-        mu_prime = max(mu, max_over_r(Z_t))
+for q_chunk, k_chunk, v_chunk in zip(
+    torch.split(q, batch_size, dim=0),
+    torch.split(k_b, batch_size, dim=0),
+    torch.split(v_b, batch_size, dim=0),
+):
+    # (B_chunk, Lq, H, D) -> (B_chunk, H, Lq, D)
+    Q = q_chunk.permute(0, 2, 1, 3).contiguous()
+    K = k_chunk.permute(0, 2, 1, 3).contiguous()
+    V = v_chunk.permute(0, 2, 1, 3).contiguous()
 
-        # update sums in a numerically-stable way
-        s  = s * exp(mu - mu_prime) \
-           + sum_over_r(exp(Z_t - mu_prime))
-        a  = a * exp(mu - mu_prime) \
-           + (exp(Z_t - mu_prime) @ V_t)
+    out = F.scaled_dot_product_attention(
+        Q,
+        K,
+        V,
+        attn_mask=None,
+        dropout_p=dropout_p if dropout_p is not None else 0.0,
+        is_causal=False,
+        scale=softmax_scale,
+    )  # (B_chunk, H, Lq, D)
 
-        mu = mu_prime
+    # -> (B_chunk, Lq, H, D)
+    outputs.append(out.permute(0, 2, 1, 3).contiguous())
 
-    O_c = a / s   # softmax-normalized weighted values for this tile
-    collect O_c
-
-return concat(all O_c along query axis)
+attention_head_outputs = torch.cat(outputs, dim=0)
 ```
 
-This produces exact results matching full attention, but with linear memory in chunk size.
+A different issue is **hardware support** for efficient attention kernels. PyTorch’s `scaled_dot_product_attention` can dispatch to several backends on CUDA: FlashAttention-2, memory-efficient attention, or a plain math implementation in C++. The availability of these specialized kernels varies across GPU generations. For educational purposes, and for those who wish to implement these kernels on older or unsupported devices, we refer to [this repository](https://github.com/lucidrains/memory-efficient-attention-pytorch/tree/main). We provide a brief sketch of how the chunking works to reduce the memory footprint below.
 
-{% include figure.liquid path="assets/img/2026-04-27-chunked-tabpfn/scaling_results.png" class="img-fluid" %}
+```python
+def chunked_attention(q, k, v, q_chunk, kv_chunk, scale):
+    """
+    q: (..., Lq, D)
+    k: (..., Lk, D)
+    v: (..., Lk, Dv)
+    q_chunk: size of query tiles (l)
+    kv_chunk: size of key/value tiles (r)
+    """
+    Lq, Lk = q.size(-2), k.size(-2)
+    outputs = []
 
-<div class="attn-figure-caption"> Figure 1. Scaling TabPFN to long contexts. Chunked TabPFN matches baseline accuracy where both fit, and extends inference to 100K+ examples. </div> 
+    for qs in range(0, Lq, q_chunk):
+        qe = min(qs + q_chunk, Lq)
+        q_tile = q[..., qs:qe, :]                            # (..., l, D)
+
+        # running stats per query row
+        mu = q_tile.new_full(q_tile.shape[:-1], -float("inf"))  # (..., l)
+        s  = torch.zeros_like(mu)                               # (..., l)
+        a  = torch.zeros(*mu.shape, v.size(-1),
+                         device=q.device, dtype=q.dtype)        # (..., l, Dv)
+
+        for ks in range(0, Lk, kv_chunk):
+            ke = min(ks + kv_chunk, Lk)
+            k_tile = k[..., ks:ke, :]                           # (..., r, D)
+            v_tile = v[..., ks:ke, :]                           # (..., r, Dv)
+
+            logits = torch.matmul(q_tile, k_tile.transpose(-2, -1)) * scale
+            local_max = logits.max(dim=-1).values               # (..., l)
+            new_mu = torch.maximum(mu, local_max)
+
+            # rescale old aggregates
+            alpha = torch.exp(mu - new_mu)
+            s *= alpha
+            a *= alpha[..., None]
+
+            # accumulate current tile
+            exp_logits = torch.exp(logits - new_mu[..., None])
+            s += exp_logits.sum(dim=-1)                         # sum_k e^{z_k}
+            a += torch.matmul(exp_logits, v_tile)               # sum_k e^{z_k} v_k
+
+            mu = new_mu
+
+        outputs.append(a / s[..., None])                        # softmax = a / s
+
+    return torch.cat(outputs, dim=-2)                           # (..., Lq, Dv)
+```
+
+In this implementation, the key components are:
+
+* It tiles queries into chunks `q_chunk` instead of processing all `Lq` at once.
+* It streams over keys/values in chunks `kv_chunk`, computing only `l × r` logits at a time.
+* It maintains per-row running statistics `(mu, s, a)` using a numerically stable log-sum-exp merge, so the final output matches full attention as if we had formed the entire `Lq × Lk` score matrix in one go.
 
 ## 3. Experiments
+
 <span id="sec:experiments"></span>
 
-### Setup
+We evaluate the TabPFN v2 model with chunking enabled on **TabArena** <d-cite key="tabarena"></d-cite>, which includes 51 tabular datasets spanning classification and regression tasks. We report scaling statistics for memory and runtime in Figure 1, and overall performance on TabArena in Figure 2. Note that in the original and subsequent reports of TabPFN, LIMIX, and TabICL on TabArena, the authors have typically imputed values that exceeded the context length for their respective methods. This might have created a distorted view of model capabilities. In Figure 2, we use only directly measured (non-imputed) results.
 
-**Benchmark.**  
-We evaluate on **TabArena** <d-cite key="tabarena"></d-cite>, which includes 51 tabular datasets spanning classification and regression tasks.  
-We focus on the “long-context” subset — datasets whose training split exceeds 1.5 × the original 10 K-row context limit of TabPFN v2.  
-These datasets normally cause out-of-memory failures in vanilla TabPFN.
+{% include figure.liquid path="assets/img/2026-04-27-chunked-tabpfn/tabarena_long_results.png" class="img-fluid" %}
 
-**Baselines.**  
-We compare against strong tree and deep tabular models:  
-AutoGluon, CatBoost, LightGBM, XGBoost, TabM <d-cite key="gorishniy2024tabm"></d-cite>, TabDPT <d-cite key="ma2024tabdpt"></d-cite>, ModernNCA <d-cite key="ye2024modern"></d-cite>, RealMLP, KNN, and TabICL.  
-All results use TabArena’s official evaluation harness (tuned / default / ensembled variants where available).
-
-**Our configuration.**  
-- Base model: TabPFN v2 weights <d-cite key="hollmann2025accurate"></d-cite>  
-- Attention: replaced by our exact chunked implementation  
-- No fine-tuning or retraining  
-- Chunk sizes (ℓ,r) tuned only for GPU memory feasibility (not accuracy)
-
-**Metrics.**  
-Following TabArena, we report:  
-- Per-dataset AUC (classification) and RMSE (regression)  
-- Aggregate leaderboard metrics (Elo score, normalized score, average rank, harmonic-mean rank, #wins, improvability)  
-- Normalized wall-clock fit and predict times  
-
-**Compute.**  
-All runs were on single GPUs (24–32 GB VRAM).  
-Our inference is purely forward-pass; “fit time” ≈ 0 because TabPFN is pre-trained.
-
----
-
-### Results
+<div class="attn-figure-caption"> Figure 1. Scaling TabPFN v2 to long contexts. Chunked TabPFN matches baseline accuracy where both fit, and extends inference to 100K+ examples. </div> 
 
 {% include figure.liquid path="assets/img/2026-04-27-chunked-tabpfn/elo_vs_baselines.png" class="img-fluid" %}
+
 <div class="attn-figure-caption">
-Figure 2. Elo and normalized score across TabArena.  
-Striped bars denote prior imputed TabPFN runs (filled with Random Forest fallbacks when OOM);  
-our chunked TabPFN reports direct measurements.
+Figure 2. Elo and normalized score across TabArena. Striped bars denote prior imputed TabPFN runs (filled with Random Forest fallbacks when OOM); our chunked TabPFN reports direct measurements.
 </div>
 
-#### Full TabArena (51 datasets)
-Chunked TabPFN v2 achieves Elo and normalized scores competitive with modern deep baselines while incurring nearly zero training time.  
-AutoML systems (e.g., AutoGluon) may edge out slightly higher Elo but require orders of magnitude more compute.
+Separately, we evaluate TabPFN v2 on the same long-context datasets while varying the context length. Specifically, we sample `num_samples` points from each dataset and then report performance, memory, and runtime in Figure 3. To better understand how context length affects TabPFN’s performance, we perform a *scaling study* on the 15 “long-context” datasets from TabArena. For each dataset, we subsample the training set to progressively larger sizes (3,000 &rarr; 5,000 &rarr; 10,000 &rarr; 20,000 &rarr; 50,000 &rarr; 100,000) and compare baseline TabPFN v2 against our Chunked TabPFN.
 
-#### Long-context subset (large datasets)
-On datasets that previously broke TabPFN’s memory limit:
+* Chunked TabPFN maintains *exact equivalence* to baseline TabPFN while extending feasible context length by roughly 10×.
+* Empirical scaling shows either plateau or monotonic improvement—never catastrophic degradation.
+* Memory and runtime growth are linear in chunk size, enabling inference on 100 K+ examples with a single GPU.
 
-- **Accuracy.**  Chunked TabPFN matches or exceeds tuned deep models in AUC / RMSE.  
-- **Efficiency.**  ~10³× lower fit time vs. AutoGluon and other AutoML systems.  
-- **Feasibility.**  Stable on commodity GPUs because peak VRAM depends on tile size instead of $n^2$.
+These findings reinforce that **TabPFN’s in-context generalization truly extends beyond its training limit**, and that the primary bottleneck was *implementation-level memory*, not *model-level capacity*.
 
-#### Observed Patterns
+{% include figure.liquid path="assets/img/2026-04-27-chunked-tabpfn/tabarena_long_results_per_dataset.png" class="img-fluid" %}
 
-1. **No degradation with scale.**  
-   As $n$ increases (10 K → 100 K), performance remains flat or improves.  
-2. **Selective benefit.**  
-   Some datasets saturate early; others continue to benefit from larger contexts — depending on task complexity and alignment with the PFN prior.  
-3. **Stable numerics.**  
-   For contexts < 10 K (where vanilla TabPFN fits), chunked and standard TabPFN produce identical predictions (up to FP precision).
-
-Overall, our method extends TabPFN from ≈10 K to >100 K training rows without changing weights or loss function, establishing a new “training-free” baseline for long-context tabular learning.
+<div class="attn-figure-caption">
+Figure 4. Scaling curves for long-context datasets. Each plot shows RMSE, AUC, wall-clock inference time (s), and peak GPU memory (MB).  
+Chunked TabPFN tracks baseline accuracy exactly up to 10 K examples and continues scaling to 100 K without degradation.
+</div>
 
 ## 4. Conclusion
 
-We presented **Chunked TabPFN**, an exact tiling strategy that enables TabPFN to process *long-context* tabular datasets (100 K + rows) without retraining, fine-tuning, or any pre-processing such as clustering or compression.
+<span id="sec:conclusion"></span>
+
+We presented **Chunked TabPFN**, an exact tiling strategy that enables TabPFN to process *long-context* tabular datasets (100 K+ rows) without retraining, fine-tuning, or any pre-processing such as clustering or compression.
 
 Our main results show:
 
-1. **Exactness without approximation.**  
-   The chunked attention computation is mathematically identical to the original transformer attention—only the evaluation order changes.  
+1. **Exactness without approximation.**
+   The chunked attention computation is mathematically identical to the original transformer attention—only the evaluation order changes.
    Predictions match baseline TabPFN bit-for-bit (within floating-point tolerance) for all short-context cases.
 
-2. **Memory scalability.**  
-   Peak GPU memory scales linearly with tile size instead of quadratically with context length.  
-   This removes the practical 10 K-sample ceiling and allows inference on 100 K + rows using 24–32 GB GPUs.
+2. **Memory scalability.**
+   Peak GPU memory scales linearly with tile size instead of quadratically with context length.
+   This removes the practical 10 K-sample ceiling and allows inference on 100 K+ rows using 24–32 GB GPUs.
 
-3. **Training-free generalization.**  
-   Chunked TabPFN retains the spirit of in-context learning: no dataset-specific training, no hyperparameter search, no adaptation steps.  
-   Despite the simplicity, it matches or surpasses tuned deep tabular models on the long-context slice of TabArena.
+3. **Training-free generalization.**
+   Chunked TabPFN retains the spirit of in-context learning: no dataset-specific training, no hyperparameter search, no adaptation steps.
+   Despite its simplicity, it matches or surpasses tuned deep tabular models on the long-context slice of TabArena.
 
-4. **Empirical insights.**  
+4. **Empirical insights.**
    Many datasets continue to improve with larger contexts—suggesting that the PFN prior generalizes beyond its nominal pre-training length.
-
----
-
-**Takeaway.**  
-TabPFN already approximates a Bayesian posterior over functions; by enabling long-context inference, we can now evaluate this posterior on arbitrarily large training sets—without modifying model weights.  
-This makes TabPFN a *true* tabular foundation model: a single frozen network that performs out-of-the-box inference across tasks, scales with more data, and runs on standard hardware.
-
----
-
-**Future work.**  
-We plan to integrate memory-efficient streaming mechanisms such as **Ring Attention** <d-cite key="ringattention"></d-cite> and to explore adaptive chunk scheduling for mixed-precision and distributed setups.  
-Together, these could extend TabPFN to millions of examples while maintaining exactness and single-pass inference.
-
-\*Equal contribution.
-
-
-## Appendix
-
-### A. Implementation Details
-
-**Goal.**  
-Enable long-context inference for TabPFN without retraining and *without approximating attention*.
-
-**Setup.**  
-We tile queries and keys/values into fixed-size blocks and accumulate softmax statistics incrementally.
-
-Let:
-$$
-Q\!\in\!\mathbb{R}^{B\times H\times L_q\times d_k}, \quad 
-K,V\!\in\!\mathbb{R}^{B\times H\times L_k\times d_k}.
-$$
-
-Choose query-tile length $\ell$ and key/value-tile length $r$.  
-For each query tile \(Q^{(c)}\):
-
-1. Initialize running max $\mu$, exponential sum $s$, and weighted sum $a$.  
-2. For each key/value tile \((K^{(t)}, V^{(t)})\):
-   \[
-   Z^{(t)} = \frac{Q^{(c)} {K^{(t)}}^{\top}}{\sqrt{d_k}}
-   \]
-   Update numerically stable accumulators:
-   \[
-   \begin{aligned}
-   \mu' &\leftarrow \max(\mu,\ \max Z^{(t)}),\\
-   s &\leftarrow s\, e^{\mu-\mu'} + \sum e^{Z^{(t)}-\mu'},\\
-   a &\leftarrow a\, e^{\mu-\mu'} + (e^{Z^{(t)}-\mu'}) V^{(t)},\\
-   \mu &\leftarrow \mu'.
-   \end{aligned}
-   \]
-3. After processing all tiles, output \(O^{(c)} = a/s\).  
-4. Concatenate all \(O^{(c)}\) to recover the full attention output.
-
-This is **exactly equivalent** to standard attention:
-$$
-\mathrm{softmax}\!\left(\tfrac{QK^\top}{\sqrt{d_k}}\right)V,
-$$
-but avoids storing the full \(L_q\times L_k\) matrix.
-
-**Complexity.**  
-- FLOPs: unchanged (\(\Theta(BH L_q L_k d_k)\))  
-- Peak memory: \(\mathcal{O}(BH(\ell r + \ell d_k + r d_k))\)  
-  → linear in tile sizes \(\ell, r\) instead of \(L_q,L_k\)
-
-**Numerical tips.**
-- Keep accumulators in the same dtype as logits.  
-- Apply dropout *after* computing \(a/s\), not inside accumulation.  
-- For large batch \(B\), optionally tile across batch before tiling \(Q,K,V\).
-
-**Implementation snippet (PyTorch).**
-
-```python
-def chunked_attention(Q, K, V, q_chunk=1024, kv_chunk=1024):
-    B, H, Lq, d = Q.shape
-    Lk = K.shape[2]
-    outputs = []
-    scale = d ** -0.5
-    for q0 in range(0, Lq, q_chunk):
-        Qc = Q[:, :, q0:q0+q_chunk, :]
-        mu = torch.full((B, H, Qc.shape[2], 1), -float("inf"), device=Q.device)
-        s = torch.zeros_like(mu)
-        a = torch.zeros(B, H, Qc.shape[2], d, device=Q.device)
-        for k0 in range(0, Lk, kv_chunk):
-            Kt = K[:, :, k0:k0+kv_chunk, :]
-            Vt = V[:, :, k0:k0+kv_chunk, :]
-            Zt = (Qc @ Kt.transpose(-2, -1)) * scale
-            mu_p = torch.maximum(mu, Zt.max(-1, keepdim=True).values)
-            expZ = torch.exp(Zt - mu_p)
-            s = s * torch.exp(mu - mu_p) + expZ.sum(-1, keepdim=True)
-            a = a * torch.exp(mu - mu_p) + expZ @ Vt
-            mu = mu_p
-        outputs.append(a / s)
-    return torch.cat(outputs, dim=2)
-```
-
-### B. Full TabArena Results
-
-The TabArena benchmark aggregates several leaderboard-style metrics:
-**Elo score**, **normalized score**, **average rank**, **harmonic-mean rank**, and **number of wins** across 51 datasets.  
-Our results follow the official TabArena evaluation harness to ensure comparability with prior work.
-
-#### Reporting Clarifications
-
-1. **Direct measurement (no imputation).**  
-   Earlier TabPFN reports occasionally *imputed* missing results—substituting Random-Forest defaults when the model ran out of memory.  
-   In contrast, all numbers reported here for **Chunked TabPFN v2** come from direct successful runs on the full datasets.
-
-2. **Runtime efficiency.**  
-   Since TabPFN is pretrained, our *fit-time* is effectively zero (only forward passes).  
-   We report normalized inference times (per 1 K examples) so that comparisons remain fair to trained models.
-
-3. **Statistical significance.**  
-   Following TabArena, we perform a Nemenyi post-hoc test on mean ranks to visualize differences between methods.
-
-#### Results Summary
-
-- **Overall performance.**  
-  Chunked TabPFN v2 attains Elo and normalized scores competitive with tuned ensemble baselines such as CatBoost (T), LightGBM (T), and AutoGluon.  
-  On several datasets, it outperforms all deep-learning counterparts despite zero training or hyper-parameter search.
-
-- **Efficiency.**  
-  Average *fit-time* speed-up over AutoGluon exceeds **10³×**, and inference latency is comparable to other transformer-based tabular models.
-
-- **Scalability.**  
-  Our method completes all 51 datasets on a single 32 GB GPU, whereas unmodified TabPFN fails beyond 10 K examples.
-
-{% include figure.liquid path="assets/img/2026-04-27-chunked-tabpfn/critical_diagram.png" class="img-fluid" %}
-<div class="attn-figure-caption">
-Figure 3. Critical-difference diagram over 51 TabArena datasets.  
-Horizontal bars connect methods not significantly different at α = 0.05.  
-Chunked TabPFN is statistically comparable to tuned ensemble-tree methods.
-</div>
-
-We also include the complete leaderboard table in our supplementary materials, following TabArena’s format.  
-In short, Chunked TabPFN achieves **competitive accuracy** and **superior efficiency** without any dataset-specific adaptation.
-
----
-
-### C. Per-Dataset Scaling Analysis
-
-To better understand how context length affects TabPFN’s performance,  
-we perform a *scaling study* on the 15 “long-context” datasets from TabArena.  
-For each dataset, we subsample the training set to progressively larger sizes  
-(3 K → 5 K → 10 K → 20 K → 50 K → 100 K) and compare baseline TabPFN v2 against our Chunked TabPFN.
-
-All experiments use identical seeds and preprocessing to isolate the effect of context length.  
-Each point in the scaling curve averages five random subsamples per dataset.
-
----
-
-#### Observed Behaviors
-
-We consistently observe three qualitative patterns:
-
-1. **Early plateau (7 / 15 datasets).**  
-   Performance improves up to around 10 K – 15 K examples and then flattens.  
-   Examples include:  
-   *amazon_employee*, *diabetes*, *bank_marketing*, *customer_satisfaction*,  
-   *food_delivery*, *kdd_cup*, and *sdss17*.  
-   These tasks likely reach an information-saturation point given the model’s prior.
-
-2. **Continuous improvement (7 / 15 datasets).**  
-   AUC ↑ and RMSE ↓ almost monotonically as context grows,  
-   with no degradation even beyond 100 K samples.  
-   Examples include:  
-   *superconductivity*, *physicochemical_protein*, *hr_analytics*, *houses*,  
-   *apsfailure*, *diamonds*, and *credit_card*.  
-   This indicates that additional in-context data directly sharpens posterior approximation.
-
-3. **Mild regression (1 / 15 dataset).**  
-   *givemesomecredit* shows a small AUC drop beyond 50 K examples,  
-   but differences are within statistical variation (< 1 σ).  
-   We hypothesize that class imbalance or label noise causes this effect.
-
----
-
-#### Quantitative Trends
-
-Across all 15 datasets:
-
-- **AUC:**   + 2.3 % average improvement when extending context from 10 K to 100 K.  
-- **RMSE:**  – 4.1 % average reduction in regression tasks.  
-- **GPU memory:**  ~ linear in tile size — 24 GB VRAM fits 100 K context with ℓ = r = 1024.  
-- **Runtime:**  grows roughly linearly with context length, not quadratically as in vanilla TabPFN.
-
----
-
-#### Visual Summary
-
-{% include figure.liquid path="assets/img/2026-04-27-chunked-tabpfn/scaling_per_dataset.png" class="img-fluid" %}
-<div class="attn-figure-caption">
-Figure 4.  Scaling curves for long-context datasets.  
-Each plot shows RMSE (↓), AUC (↑), wall-clock inference time (s), and peak GPU memory (MB).  
-Chunked TabPFN tracks baseline accuracy exactly up to 10 K examples  
-and continues scaling to 100 K without degradation.
-</div>
-
----
-
-#### Discussion
-
-These results suggest that the utility of longer context depends on both  
-dataset complexity and the PFN prior.  
-Simpler or redundant datasets reach diminishing returns once  
-the model has effectively seen all feature-label correlations,  
-while higher-entropy datasets benefit from additional examples that  
-sharpen the conditional posterior estimate.
-
-We also find that datasets with high feature sparsity or heterogeneous domains  
-(e.g., *superconductivity*) gain most from longer contexts—consistent with the  
-intuition that PFNs act like nonparametric Bayesian predictors whose accuracy  
-scales with the number of context points.
-
----
-
-#### Summary of Findings
-
-- Chunked TabPFN maintains *exact equivalence* to baseline TabPFN  
-  while extending feasible context length by roughly 10×.  
-- Empirical scaling shows either plateau or monotonic improvement—never catastrophic degradation.  
-- Memory and runtime growth are linear in chunk size, enabling inference on  
-  100 K + examples with a single GPU.  
-
-These findings reinforce that **TabPFN’s in-context generalization truly extends beyond its training limit**,  
-and that the primary bottleneck was *implementation-level memory*, not *model-level capacity*.
-
----
-
