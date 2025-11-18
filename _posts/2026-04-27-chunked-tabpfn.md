@@ -57,17 +57,15 @@ _styles: >
 ## 1. Introduction
 <span id="sec:introduction"></span>
 
-Large language models leverage **in-context learning (ICL)**: you provide examples, and the model adapts its predictions at inference time—no gradient updates required. Recent work on **tabular foundation models**, such as TabPFN, TabICL, Mitra, and Limix, applies a similar concept to tabular data. These models are trained once on synthetic tasks drawn from a prior, allowing them to approximate the posterior predictive distribution  
+Large language models leverage **in-context learning (ICL)** by adapting their predictions at inference time based solely on provided examples, without requiring any gradient updates. Building on this idea, recent work on **tabular foundation models**, such as TabPFN, TabICL, Mitra, and Limix, extends the same paradigm to tabular data. These models are trained once on synthetic tasks drawn from a prior, allowing them to approximate the posterior predictive distribution  
 
 $$
 p(y_{*} \mid x_*, D_{\text{train}})
 $$  
 
-in a single forward pass, without fine-tuning on each new dataset <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. In this work, we focus specifically on **TabPFN**, though we believe our findings could extend to other ICL-based tabular models.
+in a single forward pass by supplying the training set as context, without any dataset-specific fine-tuning, without fine-tuning on each new dataset <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. This approach is compelling because it contrasts with most deep tabular models—like TabNet, FT-Transformer, NODE, TabM, or retrieval-style models such as TabR and ModernNCA, which typically require dataset-specific training or fine-tuning <d-cite key="arik2021tabnet,gorishniy2021revisiting,popov2019neural,gorishniy2024tabm,gorishniy2023tabr,ye2024modern"></d-cite>. That dependency undermines the ideal of a true "drop-in foundation model."
 
-This approach is compelling because it contrasts with most deep tabular models—like TabNet, FT-Transformer, NODE, TabM, or retrieval-style models such as TabR and ModernNCA, which typically require dataset-specific training or fine-tuning <d-cite key="arik2021tabnet,gorishniy2021revisiting,popov2019neural,gorishniy2024tabm,gorishniy2023tabr,ye2024modern"></d-cite>. That dependency undermines the ideal of a true "drop-in foundation model."
-
-TabPFN moves closer to this ideal. However, it faces a major limitation: **context length**. Transformer attention scales quadratically with sequence length, and current public TabPFN implementations are constrained to around 3,000 samples in the original work and 50,000 in later versions <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. Many real-world tabular datasets far exceed these limits.
+ICL-based tabular models move closer to this ideal. However, they face a major practical limitation: **context length**. Transformer attention scales quadratically with sequence length, and current public TabPFN implementations are constrained to around 3,000 samples in the original work and 50,000 in later versions <d-cite key="hollmann2022tabpfn,hollmann2025accurate"></d-cite>. Many real-world tabular datasets far exceed these limits.
 
 To address this, researchers have experimented with **shrinking the context**, such as by clustering, partitioning, or retrieving only subsets of the data. Examples include random-forest partitioning <d-cite key="hollmann2025accurate"></d-cite>, the Mixture of In-Context Prompters (MICP) <d-cite key="xu2024mixture"></d-cite>, and KNN-style retrieval <d-cite key="thomas2024retrieval"></d-cite>. Others, like TuneTables <d-cite key="feuer2024tunetables"></d-cite>, compress the data into learned representations.
 
@@ -80,7 +78,7 @@ Hence, we ask the following question:
 
 > Can we fit **all training examples** into the context (no pruning, no KNN) without learnable compression while staying within GPU memory?
 
-Our answer is a resounding **yes**. Indeed, TabPFN’s native implementation already supports this on some devices via **FlashAttention**. But as we’ll show in this blogpost, there are important caveats:
+In this work, we focus specifically on TabPFN, though we believe the conclusions extend to other ICL-based tabular models. Our answer is a resounding **yes**. Indeed, TabPFN’s native implementation already supports this on some devices via **FlashAttention**. But as we’ll show in this blogpost, there are important caveats:
 
 - FlashAttention and similar efficient mechanisms can **fail** when batch or head sizes exceed 65,535.
 - These optimizations are **unsupported** on older or consumer-grade GPUs.
